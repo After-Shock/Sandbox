@@ -1,0 +1,82 @@
+##########################################################################
+# Title:            Sandbox: silo                                        #
+# Author(s):        After-Shock                                          #
+# URL:              https://github.com/saltyorg/Sandbox                  #
+# --                                                                     #
+##########################################################################
+#                   GNU General Public License v3.0                      #
+##########################################################################
+---
+- name: Remove existing Docker containers
+  ansible.builtin.include_tasks: "{{ resources_tasks_path }}/docker/remove_docker_container.yml"
+  vars:
+    container_name: "{{ item }}"
+  loop:
+    - "{{ silo_name }}"
+    - "{{ lookup('role_var', '_postgres_name', role='silo') }}"
+    - "{{ lookup('role_var', '_redis_name', role='silo') }}"
+
+- name: Reset Silo directory
+  ansible.builtin.file:
+    path: "{{ lookup('role_var', '_paths_location', role='silo') }}"
+    state: absent
+  when: ('silo-reset' in ansible_run_tags)
+
+- name: Check if '{{ lookup('role_var', '_paths_location', role='silo') }}' exists
+  ansible.builtin.stat:
+    path: "{{ lookup('role_var', '_paths_location', role='silo') }}"
+  register: silo_data_folder
+
+- name: Create directories
+  ansible.builtin.include_tasks: "{{ resources_tasks_path }}/directories/create_directories.yml"
+
+- name: "Import Postgres Role"
+  ansible.builtin.include_role:
+    name: postgres
+  vars:
+    postgres_instances: ["{{ lookup('role_var', '_postgres_name', role='silo') }}"]
+    postgres_role_docker_image_tag: "{{ lookup('role_var', '_postgres_docker_image_tag', role='silo') }}"
+    postgres_role_docker_image_repo: "{{ lookup('role_var', '_postgres_docker_image_repo', role='silo') }}"
+    postgres_role_paths_folder: "{{ lookup('role_var', '_paths_folder', role='silo') }}/postgres"
+    postgres_role_paths_location: "{{ server_appdata_path }}/{{ postgres_role_paths_folder }}"
+    postgres_role_docker_env_db: "{{ lookup('role_var', '_postgres_docker_env_db', role='silo') }}"
+    postgres_role_docker_env_user_include: "{{ lookup('role_var', '_postgres_user', role='silo') }}"
+    postgres_role_docker_env_password_include: "{{ lookup('role_var', '_postgres_password', role='silo') }}"
+    postgres_role_docker_healthcheck: "{{ lookup('role_var', '_postgres_docker_healthcheck', role='silo') }}"
+  when: lookup('role_var', '_postgres_deploy', role='silo')
+
+- name: "Import Redis Role"
+  ansible.builtin.include_role:
+    name: redis
+  vars:
+    redis_instances: ["{{ lookup('role_var', '_redis_name', role='silo') }}"]
+
+- name: "Save Silo Saltbox facts"
+  saltbox_facts:
+    role: "silo"
+    instance: "silo"
+    keys:
+      secret_key: "{{ lookup('ansible.builtin.password', '/dev/null', chars=['ascii_letters', 'digits'], length=50) }}"
+    owner: "{{ user.name }}"
+    group: "{{ user.name }}"
+    base_path: "{{ server_appdata_path }}"
+  register: silo_saltbox_facts
+
+- name: Add DNS record
+  ansible.builtin.include_tasks: "{{ resources_tasks_path }}/dns/tasker.yml"
+  vars:
+    dns_record: "{{ lookup('role_var', '_dns_record', role='silo') }}"
+    dns_zone: "{{ lookup('role_var', '_dns_zone', role='silo') }}"
+    dns_proxy: "{{ lookup('role_var', '_dns_proxy', role='silo') }}"
+
+- name: "Wait for '{{ lookup('role_var', '_postgres_name', role='silo') }}' container to be healthy"
+  community.docker.docker_container_info:
+    name: "{{ lookup('role_var', '_postgres_name', role='silo') }}"
+  until: "silo_postgres_container_info.container.State.Health.Status == 'healthy'"
+  register: silo_postgres_container_info
+  retries: 15
+  delay: 10
+  when: lookup('role_var', '_postgres_deploy', role='silo')
+
+- name: Create Docker container
+  ansible.builtin.include_tasks: "{{ resources_tasks_path }}/docker/create_docker_container.yml"
