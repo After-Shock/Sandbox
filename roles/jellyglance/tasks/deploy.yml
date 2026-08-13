@@ -62,12 +62,12 @@
     jellyglance_dns_expected_records: >-
       {{ (([{'name': lookup('role_var', '_dns_record', role='jellyglance')
                      + '.' + lookup('role_var', '_dns_zone', role='jellyglance'),
-              'type': 'A', 'content': ipv4_address_public_template,
+              'type': 'A', 'content': lookup('role_var', '_dns_ipv4', role='jellyglance'),
               'proxied': lookup('role_var', '_dns_proxy', role='jellyglance') | bool}]
              if (dns_ipv4_enabled | bool) else [])
           + ([{'name': lookup('role_var', '_dns_record', role='jellyglance')
                        + '.' + lookup('role_var', '_dns_zone', role='jellyglance'),
-                'type': 'AAAA', 'content': ipv6_address_public_template,
+                'type': 'AAAA', 'content': lookup('role_var', '_dns_ipv6', role='jellyglance'),
                 'proxied': lookup('role_var', '_dns_proxy', role='jellyglance') | bool}]
              if (dns_ipv6_enabled | bool) else []))
          | sort(attribute='type') }}

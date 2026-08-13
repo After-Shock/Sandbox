@@ -303,9 +303,9 @@
          and ((item.get('type', '') != 'A') or (dns_ipv4_enabled | bool))
          and ((item.get('type', '') != 'AAAA') or (dns_ipv6_enabled | bool))
          and ((item.get('type', '') != 'A')
-              or (item.get('content', '') == ipv4_address_public_template))
+              or (item.get('content', '') == lookup('role_var', '_dns_ipv4', role='jellyglance')))
          and ((item.get('type', '') != 'AAAA')
-              or (item.get('content', '') == ipv6_address_public_template))
+              or (item.get('content', '') == lookup('role_var', '_dns_ipv6', role='jellyglance')))
          and ((item.get('proxied', false) | bool)
               == (lookup('role_var', '_dns_proxy', role='jellyglance') | bool)) }}
   loop: "{{ jellyglance_dns_records_before }}"

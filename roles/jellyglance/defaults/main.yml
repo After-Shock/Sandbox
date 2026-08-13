@@ -79,6 +79,8 @@ jellyglance_role_web_url: "https://{{ lookup('role_var', '_web_subdomain', role=
 jellyglance_role_dns_record: "{{ lookup('role_var', '_web_subdomain', role='jellyglance') }}"
 jellyglance_role_dns_zone: "{{ lookup('role_var', '_web_domain', role='jellyglance') }}"
 jellyglance_role_dns_proxy: "{{ dns_proxied }}"
+jellyglance_role_dns_ipv4: "{{ ip_address_public }}"
+jellyglance_role_dns_ipv6: "{{ ipv6_address_public }}"
 
 ################################
 # Traefik
