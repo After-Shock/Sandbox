@@ -1,0 +1,184 @@
+---
+- name: Guarded JellyGlance rollback
+  block:
+    - name: Inspect JellyGlance rollback evidence directory
+      ansible.builtin.stat:
+        path: "{{ jellyglance_evidence_dir }}"
+        follow: false
+      register: jellyglance_rollback_evidence_dir
+
+    - name: Inspect JellyGlance rollback evidence file
+      ansible.builtin.stat:
+        path: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+        follow: false
+      register: jellyglance_rollback_evidence_file
+
+    - name: Validate JellyGlance rollback evidence interface before mutation
+      ansible.builtin.assert:
+        that:
+          - jellyglance_evidence_dir | length > 1
+          - jellyglance_evidence_dir is regex('^/')
+          - jellyglance_rollback_evidence_dir.stat.exists
+          - jellyglance_rollback_evidence_dir.stat.isdir
+          - not jellyglance_rollback_evidence_dir.stat.islnk
+          - jellyglance_rollback_evidence_file.stat.exists
+          - jellyglance_rollback_evidence_file.stat.isreg
+          - not jellyglance_rollback_evidence_file.stat.islnk
+          - jellyglance_rollback_evidence_file.stat.mode == '0600'
+        fail_msg: JellyGlance rollback evidence interface invalid
+
+    - name: Read persisted JellyGlance rollback evidence
+      ansible.builtin.slurp:
+        src: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+      register: jellyglance_rollback_evidence_raw
+      no_log: true
+
+    - name: Parse persisted JellyGlance rollback evidence
+      ansible.builtin.set_fact:
+        jellyglance_rollback_evidence: "{{ jellyglance_rollback_evidence_raw.content | b64decode | from_json }}"
+      no_log: true
+
+    - name: Validate complete JellyGlance rollback evidence schema
+      ansible.builtin.assert:
+        that:
+          - jellyglance_rollback_evidence.version == 1
+          - jellyglance_rollback_evidence.preexisting_app_id is string
+          - jellyglance_rollback_evidence.preexisting_postgres_id is string
+          - jellyglance_rollback_evidence.current.app_id is string
+          - jellyglance_rollback_evidence.current.postgres_id is string
+          - jellyglance_rollback_evidence.runtime_created.app_id is string
+          - jellyglance_rollback_evidence.runtime_created.postgres_id is string
+          - jellyglance_rollback_evidence.dns.dns_created_by_run | type_debug == 'bool'
+          - jellyglance_rollback_evidence.dns.mutation_attempted | type_debug == 'bool'
+          - jellyglance_rollback_evidence.dns.expected_records | type_debug == 'list'
+          - jellyglance_rollback_evidence.dns.created_records | type_debug == 'list'
+        fail_msg: JellyGlance rollback evidence schema invalid
+
+    - name: Validate persisted JellyGlance rollback DNS entry schema
+      ansible.builtin.assert:
+        that:
+          - item | type_debug == 'dict'
+          - item.keys() | sort == ['content', 'name', 'proxied', 'type']
+          - item.type in ['A', 'AAAA']
+          - item.name is string
+          - item.content is string
+          - item.proxied | type_debug == 'bool'
+      loop: >-
+        {{ jellyglance_rollback_evidence.dns.expected_records
+           + jellyglance_rollback_evidence.dns.created_records }}
+      no_log: true
+
+    - name: Query current JellyGlance rollback container identities
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.Id}}' }}"
+          - "{{ item }}"
+      loop:
+        - "{{ lookup('role_var', '_docker_container', role='jellyglance') }}"
+        - "{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"
+      register: jellyglance_rollback_current_ids
+      changed_when: false
+      failed_when: false
+
+    - name: Calculate guarded JellyGlance container rollback scope
+      ansible.builtin.set_fact:
+        jellyglance_rollback_remove_app: >-
+          {{ (jellyglance_rollback_current_ids.results[0].stdout | default('') | length > 0)
+             and (jellyglance_rollback_current_ids.results[0].stdout
+                  != jellyglance_rollback_evidence.preexisting_app_id)
+             and (jellyglance_rollback_current_ids.results[0].stdout
+                  == jellyglance_rollback_evidence.runtime_created.app_id) }}
+        jellyglance_rollback_remove_postgres: >-
+          {{ (jellyglance_rollback_current_ids.results[1].stdout | default('') | length > 0)
+             and (jellyglance_rollback_current_ids.results[1].stdout
+                  != jellyglance_rollback_evidence.preexisting_postgres_id)
+             and (jellyglance_rollback_current_ids.results[1].stdout
+                  == jellyglance_rollback_evidence.runtime_created.postgres_id) }}
+
+    - name: Query current JellyGlance DNS before guarded rollback
+      cloudflare_dns_records:
+        auth_email: "{{ cloudflare.email }}"
+        auth_key: "{{ cloudflare.api }}"
+        zone_name: "{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+        record: "{{ lookup('role_var', '_dns_record', role='jellyglance') }}.{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+      register: jellyglance_rollback_dns_query
+      no_log: true
+      when:
+        - jellyglance_rollback_evidence.dns.mutation_attempted | bool
+        - cloudflare_records_enabled
+        - role_dns_enabled
+        - not skip_dns
+
+    - name: Initialize normalized JellyGlance rollback DNS observations
+      ansible.builtin.set_fact:
+        jellyglance_rollback_dns_current: []
+
+    - name: Normalize nonsecret JellyGlance rollback DNS observations
+      ansible.builtin.set_fact:
+        jellyglance_rollback_dns_current: >-
+          {{ jellyglance_rollback_dns_current
+             + [{'name': item.name, 'type': item.type, 'content': item.content,
+                 'proxied': item.proxied | bool}] }}
+      loop: "{{ jellyglance_rollback_dns_query.records | default([]) }}"
+      when:
+        - jellyglance_rollback_evidence.dns.mutation_attempted | bool
+        - cloudflare_records_enabled
+        - role_dns_enabled
+        - not skip_dns
+      no_log: true
+
+    - name: Validate normalized JellyGlance rollback DNS entry schema
+      ansible.builtin.assert:
+        that:
+          - item | type_debug == 'dict'
+          - item.keys() | sort == ['content', 'name', 'proxied', 'type']
+          - item.type in ['A', 'AAAA']
+      loop: "{{ jellyglance_rollback_dns_current }}"
+      no_log: true
+
+    - name: Canonicalize JellyGlance rollback DNS sets
+      ansible.builtin.set_fact:
+        jellyglance_rollback_dns_current_canonical: "{{ jellyglance_rollback_dns_current | sort(attribute='type') }}"
+        jellyglance_rollback_dns_expected_canonical: "{{ jellyglance_rollback_evidence.dns.expected_records | sort(attribute='type') }}"
+        jellyglance_rollback_dns_created_canonical: "{{ jellyglance_rollback_evidence.dns.created_records | sort(attribute='type') }}"
+
+    - name: Calculate exact JellyGlance DNS rollback scope
+      ansible.builtin.set_fact:
+        jellyglance_rollback_remove_dns: >-
+          {{ (jellyglance_rollback_evidence.dns.mutation_attempted | bool)
+             and (jellyglance_rollback_evidence.dns.before | length == 0)
+             and (((jellyglance_rollback_evidence.dns.dns_created_by_run | bool)
+                   and (jellyglance_rollback_dns_current_canonical
+                        == jellyglance_rollback_dns_created_canonical))
+                  or ((not (jellyglance_rollback_evidence.dns.dns_created_by_run | bool))
+                      and (jellyglance_rollback_dns_current_canonical
+                           == jellyglance_rollback_dns_expected_canonical))) }}
+
+    - name: Remove runtime-created JellyGlance application container only
+      ansible.builtin.include_tasks: "{{ resources_tasks_path }}/docker/remove_docker_container.yml"
+      vars:
+        container_name: "{{ lookup('role_var', '_docker_container', role='jellyglance') }}"
+      when: jellyglance_rollback_remove_app | bool
+
+    - name: Remove runtime-created JellyGlance PostgreSQL container only
+      ansible.builtin.include_tasks: "{{ resources_tasks_path }}/docker/remove_docker_container.yml"
+      vars:
+        container_name: "{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"
+      when: jellyglance_rollback_remove_postgres | bool
+
+    - name: Remove exact runtime-created JellyGlance DNS records only
+      ansible.builtin.include_tasks: "{{ resources_tasks_path }}/dns/tasker.yml"
+      vars:
+        dns_action: remove
+        dns_record: "{{ lookup('role_var', '_dns_record', role='jellyglance') }}"
+        dns_zone: "{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+        dns_proxy: "{{ lookup('role_var', '_dns_proxy', role='jellyglance') }}"
+      when: jellyglance_rollback_remove_dns | bool
+  rescue:
+    - name: Report redacted JellyGlance guarded rollback failure
+      ansible.builtin.fail:
+        msg: JellyGlance guarded rollback failed closed
+      no_log: true

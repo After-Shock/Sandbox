@@ -1,0 +1,57 @@
+---
+- name: Validate JellyGlance rollback mode interface
+  ansible.builtin.assert:
+    that:
+      - jellyglance_rollback_only | type_debug == 'bool'
+    fail_msg: JellyGlance rollback mode must be boolean
+
+- name: Run guarded JellyGlance rollback only
+  ansible.builtin.include_tasks: rollback.yml
+  when: jellyglance_rollback_only | bool
+
+- name: Deploy JellyGlance with guarded rollback
+  when: not (jellyglance_rollback_only | bool)
+  block:
+    - name: Inspect JellyGlance evidence directory before preparation
+      ansible.builtin.stat:
+        path: "{{ jellyglance_evidence_dir }}"
+        follow: false
+      register: jellyglance_evidence_initial_stat
+
+    - name: Reject unsafe existing JellyGlance evidence path
+      ansible.builtin.assert:
+        that:
+          - jellyglance_evidence_dir | length > 1
+          - jellyglance_evidence_dir is regex('^/')
+          - not jellyglance_evidence_initial_stat.stat.exists or (jellyglance_evidence_initial_stat.stat.isdir and not jellyglance_evidence_initial_stat.stat.islnk)
+        fail_msg: JellyGlance evidence path type invalid
+
+    - name: Prepare JellyGlance evidence directory
+      ansible.builtin.file:
+        path: "{{ jellyglance_evidence_dir }}"
+        state: directory
+        mode: "0700"
+        owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+        group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+    - name: Preflight JellyGlance before mutation
+      ansible.builtin.include_tasks: preflight.yml
+
+    - name: Prepare validated JellyGlance secrets
+      ansible.builtin.include_tasks:
+        file: secrets.yml
+        apply:
+          no_log: true
+
+    - name: Run guarded JellyGlance deployment
+      block:
+        - name: Deploy JellyGlance resources
+          ansible.builtin.include_tasks: deploy.yml
+      rescue:
+        - name: Roll back resources created by this JellyGlance run
+          ansible.builtin.include_tasks: rollback.yml
+
+        - name: Report redacted JellyGlance deployment failure
+          ansible.builtin.fail:
+            msg: JellyGlance deployment failed and guarded rollback completed
+          no_log: true

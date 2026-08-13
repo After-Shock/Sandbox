@@ -1,0 +1,409 @@
+---
+- name: Inspect pre-existing JellyGlance container identities
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - --format
+      - "{{ '{{.Id}}' }}"
+      - "{{ item }}"
+  loop:
+    - "{{ lookup('role_var', '_docker_container', role='jellyglance') }}"
+    - "{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"
+  register: jellyglance_preexisting_container_ids
+  changed_when: false
+  failed_when: false
+
+- name: Initialize complete JellyGlance deployment evidence
+  ansible.builtin.set_fact:
+    jellyglance_deployment_evidence:
+      version: 1
+      preexisting_app_id: "{{ jellyglance_preexisting_container_ids.results[0].stdout | default('') }}"
+      preexisting_postgres_id: "{{ jellyglance_preexisting_container_ids.results[1].stdout | default('') }}"
+      current:
+        app_id: "{{ jellyglance_preexisting_container_ids.results[0].stdout | default('') }}"
+        postgres_id: "{{ jellyglance_preexisting_container_ids.results[1].stdout | default('') }}"
+      runtime_created:
+        app_id: ""
+        postgres_id: ""
+      dns:
+        before: "{{ jellyglance_dns_records_before | sort(attribute='type') }}"
+        after: "{{ jellyglance_dns_records_before | sort(attribute='type') }}"
+        expected_records: []
+        created_records: []
+        mutation_attempted: false
+        dns_created_by_run: false
+      jellyfin:
+        before: "{{ jellyglance_jellyfin_before }}"
+        after_postgres: {}
+        after_app: {}
+
+- name: Persist initial complete JellyGlance deployment evidence atomically
+  ansible.builtin.copy:
+    content: "{{ jellyglance_deployment_evidence | to_nice_json }}\n"
+    dest: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+    mode: "0600"
+    owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+    group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Persist JellyGlance Jellyfin baseline 00 atomically
+  ansible.builtin.copy:
+    content: "{{ jellyglance_jellyfin_before | to_nice_json }}\n"
+    dest: "{{ jellyglance_evidence_dir }}/00-jellyfin-before.json"
+    mode: "0600"
+    owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+    group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Create JellyGlance config and backup directories through Saltbox
+  ansible.builtin.include_tasks: "{{ resources_tasks_path }}/directories/create_directories.yml"
+
+- name: Calculate canonical expected JellyGlance DNS records
+  ansible.builtin.set_fact:
+    jellyglance_dns_expected_records: >-
+      {{ (([{'name': lookup('role_var', '_dns_record', role='jellyglance')
+                     + '.' + lookup('role_var', '_dns_zone', role='jellyglance'),
+              'type': 'A', 'content': ipv4_address_public_template,
+              'proxied': lookup('role_var', '_dns_proxy', role='jellyglance') | bool}]
+             if (dns_ipv4_enabled | bool) else [])
+          + ([{'name': lookup('role_var', '_dns_record', role='jellyglance')
+                       + '.' + lookup('role_var', '_dns_zone', role='jellyglance'),
+                'type': 'AAAA', 'content': ipv6_address_public_template,
+                'proxied': lookup('role_var', '_dns_proxy', role='jellyglance') | bool}]
+             if (dns_ipv6_enabled | bool) else []))
+         | sort(attribute='type') }}
+
+- name: Record JellyGlance DNS mutation attempt before the tasker
+  ansible.builtin.set_fact:
+    jellyglance_deployment_evidence: >-
+      {{ jellyglance_deployment_evidence
+         | combine({'dns': {
+             'before': jellyglance_dns_records_before | sort(attribute='type'),
+             'after': jellyglance_dns_records_before | sort(attribute='type'),
+             'expected_records': jellyglance_dns_expected_records,
+             'created_records': [],
+             'mutation_attempted': (cloudflare_records_enabled and role_dns_enabled and not skip_dns),
+             'dns_created_by_run': false
+           }}, recursive=True) }}
+
+- name: Persist JellyGlance DNS mutation-attempt evidence atomically
+  ansible.builtin.copy:
+    content: "{{ jellyglance_deployment_evidence | to_nice_json }}\n"
+    dest: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+    mode: "0600"
+    owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+    group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Add JellyGlance DNS records through the standard tasker
+  ansible.builtin.include_tasks: "{{ resources_tasks_path }}/dns/tasker.yml"
+  vars:
+    dns_record: "{{ lookup('role_var', '_dns_record', role='jellyglance') }}"
+    dns_zone: "{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+    dns_proxy: "{{ lookup('role_var', '_dns_proxy', role='jellyglance') }}"
+
+- name: Re-query JellyGlance DNS records after the standard tasker
+  cloudflare_dns_records:
+    auth_email: "{{ cloudflare.email }}"
+    auth_key: "{{ cloudflare.api }}"
+    zone_name: "{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+    record: "{{ lookup('role_var', '_dns_record', role='jellyglance') }}.{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+  register: jellyglance_dns_after_query
+  no_log: true
+  when:
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+
+- name: Initialize normalized JellyGlance post-DNS observations
+  ansible.builtin.set_fact:
+    jellyglance_dns_records_after: "{{ jellyglance_dns_records_before }}"
+
+- name: Reset enabled JellyGlance post-DNS observations
+  ansible.builtin.set_fact:
+    jellyglance_dns_records_after: []
+  when:
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+
+- name: Normalize nonsecret JellyGlance post-DNS observations
+  ansible.builtin.set_fact:
+    jellyglance_dns_records_after: >-
+      {{ jellyglance_dns_records_after
+         + [{'name': item.name, 'type': item.type, 'content': item.content,
+             'proxied': item.proxied | bool}] }}
+  loop: "{{ jellyglance_dns_after_query.records | default([]) }}"
+  when:
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+  no_log: true
+
+- name: Calculate exact JellyGlance post-DNS state
+  ansible.builtin.set_fact:
+    jellyglance_dns_post_exact: >-
+      {{ (jellyglance_dns_records_after | length == jellyglance_dns_expected_records | length)
+         and ((jellyglance_dns_records_after | sort(attribute='type'))
+              == jellyglance_dns_expected_records) }}
+  when:
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+
+- name: Advise when JellyGlance DNS definedness is not exact
+  ansible.builtin.assert:
+    that:
+      - jellyglance_dns_post_exact | default(false) | bool
+    fail_msg: JellyGlance DNS post-state is not the exact expected record set
+  when:
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+
+- name: Record exact JellyGlance DNS creation evidence
+  ansible.builtin.set_fact:
+    jellyglance_deployment_evidence: >-
+      {{ jellyglance_deployment_evidence
+         | combine({'dns': {
+             'before': jellyglance_dns_records_before,
+             'after': jellyglance_dns_records_after | sort(attribute='type'),
+             'created_records': (jellyglance_dns_records_after | sort(attribute='type')
+                                 if (jellyglance_dns_records_before | length == 0
+                                     and (jellyglance_dns_post_exact | default(false) | bool)) else []),
+             'dns_created_by_run': (jellyglance_dns_records_before | length == 0
+                                    and (jellyglance_dns_post_exact | default(false) | bool))
+           }}, recursive=True) }}
+
+- name: Persist complete JellyGlance DNS evidence atomically
+  ansible.builtin.copy:
+    content: "{{ jellyglance_deployment_evidence | to_nice_json }}\n"
+    dest: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+    mode: "0600"
+    owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+    group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Deploy and checkpoint JellyGlance PostgreSQL
+  block:
+    - name: Deploy mandatory JellyGlance PostgreSQL role
+      ansible.builtin.include_role:
+        name: postgres
+        apply:
+          no_log: true
+      vars:
+        postgres_instances: ["{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"]
+        postgres_role_docker_image_repo: "{{ lookup('role_var', '_postgres_docker_image_repo', role='jellyglance') }}"
+        postgres_role_docker_image_tag: "{{ lookup('role_var', '_postgres_docker_image_tag', role='jellyglance') }}"
+        postgres_role_docker_shm_size: "{{ lookup('role_var', '_postgres_docker_shm_size', role='jellyglance') }}"
+        postgres_role_paths_folder: "{{ lookup('role_var', '_postgres_paths_folder', role='jellyglance') }}"
+        postgres_role_paths_location: "{{ lookup('role_var', '_postgres_paths_location', role='jellyglance') }}"
+        postgres_role_docker_env_db: "{{ lookup('role_var', '_postgres_docker_env_db', role='jellyglance') }}"
+        postgres_role_docker_env_user_include: "{{ lookup('role_var', '_postgres_user', role='jellyglance') }}"
+        postgres_role_docker_env_password_include: "{{ jellyglance_postgres_password }}"
+        postgres_role_docker_healthcheck: "{{ lookup('role_var', '_postgres_docker_healthcheck', role='jellyglance') }}"
+      no_log: true
+
+    - name: Wait for healthy JellyGlance PostgreSQL
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.State.Health.Status}}' }}"
+          - "{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"
+      register: jellyglance_postgres_health
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: jellyglance_postgres_health.stdout == 'healthy'
+  always:
+    - name: Inspect current JellyGlance PostgreSQL identity immediately
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.Id}}' }}"
+          - "{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"
+      register: jellyglance_postgres_current_id
+      changed_when: false
+      failed_when: false
+
+    - name: Update complete JellyGlance PostgreSQL identity evidence
+      ansible.builtin.set_fact:
+        jellyglance_deployment_evidence: >-
+          {{ jellyglance_deployment_evidence
+             | combine({'current': {
+                 'app_id': jellyglance_deployment_evidence.current.app_id,
+                 'postgres_id': jellyglance_postgres_current_id.stdout | default('')
+               }, 'runtime_created': {
+                 'app_id': jellyglance_deployment_evidence.runtime_created.app_id,
+                 'postgres_id': ((jellyglance_postgres_current_id.stdout | default(''))
+                                 if ((jellyglance_postgres_current_id.stdout | default('') | length > 0)
+                                     and (jellyglance_postgres_current_id.stdout | default('')
+                                          != jellyglance_deployment_evidence.preexisting_postgres_id)) else '')
+               }}, recursive=True) }}
+
+    - name: Persist complete JellyGlance PostgreSQL identity evidence atomically
+      ansible.builtin.copy:
+        content: "{{ jellyglance_deployment_evidence | to_nice_json }}\n"
+        dest: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+        mode: "0600"
+        owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+        group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Capture Jellyfin checkpoint 10 after healthy PostgreSQL
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - --format
+      - "{{ item.format }}"
+      - jellyfin
+  loop:
+    - key: name
+      format: "{{ '{{.Name}}' }}"
+    - key: id
+      format: "{{ '{{.Id}}' }}"
+    - key: image
+      format: "{{ '{{.Config.Image}}' }}"
+    - key: started_at
+      format: "{{ '{{.State.StartedAt}}' }}"
+    - key: running
+      format: "{{ '{{.State.Running}}' }}"
+    - key: health
+      format: "{{ '{{if .State.Health}}{{.State.Health.Status}}{{end}}' }}"
+  register: jellyglance_jellyfin_after_postgres_fields
+  changed_when: false
+
+- name: Normalize Jellyfin checkpoint 10
+  ansible.builtin.set_fact:
+    jellyglance_jellyfin_after_postgres:
+      name: "{{ jellyglance_jellyfin_after_postgres_fields.results[0].stdout | regex_replace('^/', '') }}"
+      id: "{{ jellyglance_jellyfin_after_postgres_fields.results[1].stdout }}"
+      image: "{{ jellyglance_jellyfin_after_postgres_fields.results[2].stdout }}"
+      started_at: "{{ jellyglance_jellyfin_after_postgres_fields.results[3].stdout }}"
+      running: "{{ jellyglance_jellyfin_after_postgres_fields.results[4].stdout | bool }}"
+      health: "{{ jellyglance_jellyfin_after_postgres_fields.results[5].stdout }}"
+
+- name: Persist JellyGlance Jellyfin checkpoint 10 atomically
+  ansible.builtin.copy:
+    content: "{{ jellyglance_jellyfin_after_postgres | to_nice_json }}\n"
+    dest: "{{ jellyglance_evidence_dir }}/10-jellyfin-after-postgres.json"
+    mode: "0600"
+    owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+    group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Record Jellyfin checkpoint 10 in complete evidence
+  ansible.builtin.set_fact:
+    jellyglance_deployment_evidence: >-
+      {{ jellyglance_deployment_evidence
+         | combine({'jellyfin': {'after_postgres': jellyglance_jellyfin_after_postgres}}, recursive=True) }}
+
+- name: Deploy and checkpoint JellyGlance application
+  block:
+    - name: Create JellyGlance application container
+      ansible.builtin.include_tasks:
+        file: "{{ resources_tasks_path }}/docker/create_docker_container.yml"
+        apply:
+          no_log: true
+
+    - name: Wait for healthy JellyGlance application
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.State.Health.Status}}' }}"
+          - "{{ lookup('role_var', '_docker_container', role='jellyglance') }}"
+      register: jellyglance_app_health
+      changed_when: false
+      retries: 30
+      delay: 2
+      until: jellyglance_app_health.stdout == 'healthy'
+  always:
+    - name: Inspect current JellyGlance application identity immediately
+      ansible.builtin.command:
+        argv:
+          - docker
+          - inspect
+          - --format
+          - "{{ '{{.Id}}' }}"
+          - "{{ lookup('role_var', '_docker_container', role='jellyglance') }}"
+      register: jellyglance_app_current_id
+      changed_when: false
+      failed_when: false
+
+    - name: Update complete JellyGlance application identity evidence
+      ansible.builtin.set_fact:
+        jellyglance_deployment_evidence: >-
+          {{ jellyglance_deployment_evidence
+             | combine({'current': {
+                 'app_id': jellyglance_app_current_id.stdout | default(''),
+                 'postgres_id': jellyglance_deployment_evidence.current.postgres_id
+               }, 'runtime_created': {
+                 'app_id': ((jellyglance_app_current_id.stdout | default(''))
+                            if ((jellyglance_app_current_id.stdout | default('') | length > 0)
+                                and (jellyglance_app_current_id.stdout | default('')
+                                     != jellyglance_deployment_evidence.preexisting_app_id)) else ''),
+                 'postgres_id': jellyglance_deployment_evidence.runtime_created.postgres_id
+               }}, recursive=True) }}
+
+    - name: Persist complete JellyGlance application identity evidence atomically
+      ansible.builtin.copy:
+        content: "{{ jellyglance_deployment_evidence | to_nice_json }}\n"
+        dest: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+        mode: "0600"
+        owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+        group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Capture Jellyfin checkpoint 20 after healthy application
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - --format
+      - "{{ item.format }}"
+      - jellyfin
+  loop:
+    - key: name
+      format: "{{ '{{.Name}}' }}"
+    - key: id
+      format: "{{ '{{.Id}}' }}"
+    - key: image
+      format: "{{ '{{.Config.Image}}' }}"
+    - key: started_at
+      format: "{{ '{{.State.StartedAt}}' }}"
+    - key: running
+      format: "{{ '{{.State.Running}}' }}"
+    - key: health
+      format: "{{ '{{if .State.Health}}{{.State.Health.Status}}{{end}}' }}"
+  register: jellyglance_jellyfin_after_app_fields
+  changed_when: false
+
+- name: Normalize Jellyfin checkpoint 20
+  ansible.builtin.set_fact:
+    jellyglance_jellyfin_after_app:
+      name: "{{ jellyglance_jellyfin_after_app_fields.results[0].stdout | regex_replace('^/', '') }}"
+      id: "{{ jellyglance_jellyfin_after_app_fields.results[1].stdout }}"
+      image: "{{ jellyglance_jellyfin_after_app_fields.results[2].stdout }}"
+      started_at: "{{ jellyglance_jellyfin_after_app_fields.results[3].stdout }}"
+      running: "{{ jellyglance_jellyfin_after_app_fields.results[4].stdout | bool }}"
+      health: "{{ jellyglance_jellyfin_after_app_fields.results[5].stdout }}"
+
+- name: Persist JellyGlance Jellyfin checkpoint 20 atomically
+  ansible.builtin.copy:
+    content: "{{ jellyglance_jellyfin_after_app | to_nice_json }}\n"
+    dest: "{{ jellyglance_evidence_dir }}/20-jellyfin-after-app.json"
+    mode: "0600"
+    owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+    group: "{{ user.name if jellyglance_test_mode else 'root' }}"
+
+- name: Persist final complete JellyGlance deployment evidence atomically
+  ansible.builtin.copy:
+    content: >-
+      {{ (jellyglance_deployment_evidence
+          | combine({'jellyfin': {'after_app': jellyglance_jellyfin_after_app}}, recursive=True))
+         | to_nice_json }}
+    dest: "{{ jellyglance_evidence_dir }}/jellyglance-deployment.json"
+    mode: "0600"
+    owner: "{{ user.name if jellyglance_test_mode else 'root' }}"
+    group: "{{ user.name if jellyglance_test_mode else 'root' }}"

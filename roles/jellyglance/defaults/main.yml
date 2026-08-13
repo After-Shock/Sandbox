@@ -1,0 +1,171 @@
+#########################################################################
+# Title:            Sandbox: JellyGlance                                #
+# Author(s):        salty                                               #
+# URL:              https://github.com/saltyorg/Sandbox                 #
+# --                                                                    #
+#########################################################################
+#                   GNU General Public License v3.0                     #
+#########################################################################
+---
+################################
+# Basics
+################################
+
+jellyglance_name: jellyglance
+
+################################
+# Settings
+################################
+
+jellyglance_test_mode: false
+jellyglance_test_init_jwt_secret: ""
+jellyglance_test_init_postgres_password: ""
+jellyglance_rollback_only: false
+jellyglance_evidence_dir: "/var/lib/jellyglance-deploy/{{ jellyglance_name }}"
+jellyglance_jwt_secret: ""
+jellyglance_postgres_password: ""
+
+################################
+# Postgres
+################################
+
+jellyglance_role_postgres_name: "{{ jellyglance_name }}-postgres"
+jellyglance_role_postgres_user: "jellyglance"
+jellyglance_role_postgres_docker_env_db: "jellyglance"
+jellyglance_role_postgres_docker_image_repo: "postgres"
+jellyglance_role_postgres_docker_image_tag: "16-alpine"
+jellyglance_role_postgres_docker_image: "{{ lookup('role_var', '_postgres_docker_image_repo', role='jellyglance') }}:{{ lookup('role_var', '_postgres_docker_image_tag', role='jellyglance') }}"
+jellyglance_role_postgres_docker_shm_size: "1G"
+jellyglance_role_postgres_docker_healthcheck:
+  test: ["CMD-SHELL", "pg_isready -d {{ lookup('role_var', '_postgres_docker_env_db', role='jellyglance') }} -U {{ lookup('role_var', '_postgres_user', role='jellyglance') }}"]
+  start_period: 20s
+  interval: 30s
+  retries: 5
+  timeout: 5s
+jellyglance_role_postgres_paths_folder: "{{ jellyglance_name }}"
+jellyglance_role_postgres_paths_location: "{{ lookup('role_var', '_paths_postgres_location', role='jellyglance') }}"
+
+################################
+# Paths
+################################
+
+jellyglance_role_paths_folder: "{{ jellyglance_name }}"
+jellyglance_role_paths_location: "{{ server_appdata_path }}/{{ lookup('role_var', '_paths_folder', role='jellyglance') }}"
+jellyglance_role_paths_config_location: "{{ lookup('role_var', '_paths_location', role='jellyglance') }}/config"
+jellyglance_role_paths_backups_location: "{{ lookup('role_var', '_paths_location', role='jellyglance') }}/backups"
+jellyglance_role_paths_postgres_location: "{{ lookup('role_var', '_paths_location', role='jellyglance') }}/postgres"
+jellyglance_role_paths_jwt_secret_file: "{{ lookup('role_var', '_paths_location', role='jellyglance') }}/jwt_secret.txt"
+jellyglance_role_paths_postgres_password_file: "{{ lookup('role_var', '_paths_location', role='jellyglance') }}/postgres_password.txt"
+jellyglance_role_paths_folders_list:
+  - "{{ lookup('role_var', '_paths_location', role='jellyglance') }}"
+  - "{{ lookup('role_var', '_paths_config_location', role='jellyglance') }}"
+  - "{{ lookup('role_var', '_paths_backups_location', role='jellyglance') }}"
+
+################################
+# Web
+################################
+
+jellyglance_role_web_subdomain: "{{ jellyglance_name }}"
+jellyglance_role_web_domain: "{{ user.domain }}"
+jellyglance_role_web_port: "3000"
+jellyglance_role_web_url: "https://{{ lookup('role_var', '_web_subdomain', role='jellyglance') + '.' + lookup('role_var', '_web_domain', role='jellyglance')
+                                   if (lookup('role_var', '_web_subdomain', role='jellyglance') | length > 0)
+                                   else lookup('role_var', '_web_domain', role='jellyglance') }}"
+
+################################
+# DNS
+################################
+
+jellyglance_role_dns_record: "{{ lookup('role_var', '_web_subdomain', role='jellyglance') }}"
+jellyglance_role_dns_zone: "{{ lookup('role_var', '_web_domain', role='jellyglance') }}"
+jellyglance_role_dns_proxy: "{{ dns_proxied }}"
+
+################################
+# Traefik
+################################
+
+jellyglance_role_traefik_sso_middleware: ""
+jellyglance_role_traefik_middleware_default: "{{ traefik_default_middleware }}"
+jellyglance_role_traefik_middleware_custom: ""
+jellyglance_role_traefik_certresolver: "{{ traefik_default_certresolver }}"
+jellyglance_role_traefik_enabled: true
+jellyglance_role_traefik_api_enabled: false
+jellyglance_role_traefik_api_endpoint: ""
+
+################################
+# Docker
+################################
+
+# Container
+jellyglance_role_docker_container: "{{ jellyglance_name }}"
+
+# Image
+jellyglance_role_docker_image_pull: true
+jellyglance_role_docker_image_repo: "ghcr.io/nerdy-technician/jellyglance"
+jellyglance_role_docker_image_tag: "latest"
+jellyglance_role_docker_image: "{{ lookup('role_var', '_docker_image_repo', role='jellyglance') }}:{{ lookup('role_var', '_docker_image_tag', role='jellyglance') }}"
+
+# Envs
+jellyglance_role_docker_envs_default:
+  POSTGRES_USER: "{{ lookup('role_var', '_postgres_user', role='jellyglance') }}"
+  POSTGRES_PASSWORD: "{{ jellyglance_postgres_password }}"
+  POSTGRES_IP: "{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "{{ lookup('role_var', '_postgres_docker_env_db', role='jellyglance') }}"
+  JWT_SECRET: "{{ jellyglance_jwt_secret }}"
+  TZ: "{{ tz }}"
+  CONFIG_DIR: "/app/config"
+  BACKUP_DIR: "/app/backups"
+  CORS_ORIGINS: "{{ lookup('role_var', '_web_url', role='jellyglance') }}"
+jellyglance_role_docker_envs_protected:
+  - POSTGRES_USER
+  - POSTGRES_PASSWORD
+  - POSTGRES_IP
+  - POSTGRES_PORT
+  - POSTGRES_DB
+  - JWT_SECRET
+  - TZ
+  - CONFIG_DIR
+  - BACKUP_DIR
+  - CORS_ORIGINS
+jellyglance_role_docker_envs_custom: {}
+jellyglance_role_docker_envs: "{{ lookup('role_var', '_docker_envs_default', role='jellyglance')
+                                  | combine(lookup('role_var', '_docker_envs_custom', role='jellyglance')) }}"
+
+# Volumes
+jellyglance_role_docker_volumes_default:
+  - "{{ lookup('role_var', '_paths_config_location', role='jellyglance') }}:/app/config"
+  - "{{ lookup('role_var', '_paths_backups_location', role='jellyglance') }}:/app/backups"
+jellyglance_role_docker_volume_targets_protected:
+  - "/app/config"
+  - "/app/backups"
+jellyglance_role_docker_volumes_custom: []
+jellyglance_role_docker_volumes: "{{ lookup('role_var', '_docker_volumes_default', role='jellyglance')
+                                     + lookup('role_var', '_docker_volumes_custom', role='jellyglance') }}"
+
+# Hostname
+jellyglance_role_docker_hostname: "{{ jellyglance_name }}"
+
+# Networks
+jellyglance_role_docker_networks_alias: "{{ jellyglance_name }}"
+jellyglance_role_docker_networks_default: []
+jellyglance_role_docker_networks_custom: []
+jellyglance_role_docker_networks: "{{ docker_networks_common
+                                      + lookup('role_var', '_docker_networks_default', role='jellyglance')
+                                      + lookup('role_var', '_docker_networks_custom', role='jellyglance') }}"
+
+# Restart Policy
+jellyglance_role_docker_restart_policy: unless-stopped
+
+# Healthcheck
+jellyglance_role_docker_healthcheck:
+  test: "wget -q -O - http://localhost:{{ lookup('role_var', '_web_port', role='jellyglance') }}/auth/isConfigured"
+  interval: 30s
+  retries: 10
+  start_period: 30s
+  timeout: 10s
+
+# Dependencies
+jellyglance_role_depends_on: "{{ lookup('role_var', '_postgres_name', role='jellyglance') }}"
+jellyglance_role_depends_on_delay: "0"
+jellyglance_role_depends_on_healthchecks: "true"

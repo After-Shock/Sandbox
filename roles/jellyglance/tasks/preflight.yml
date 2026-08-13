@@ -1,0 +1,322 @@
+---
+- name: Reject JellyGlance test mode outside continuous integration
+  ansible.builtin.assert:
+    that:
+      - not jellyglance_test_mode or (continuous_integration | default(false) | bool)
+    fail_msg: JellyGlance test mode requires continuous integration
+
+- name: Inspect JellyGlance evidence directory
+  ansible.builtin.stat:
+    path: "{{ jellyglance_evidence_dir }}"
+    follow: false
+  register: jellyglance_evidence_stat
+
+- name: Validate JellyGlance evidence interface
+  ansible.builtin.assert:
+    that:
+      - jellyglance_evidence_dir | length > 1
+      - jellyglance_evidence_dir is regex('^/')
+      - jellyglance_evidence_stat.stat.exists
+      - jellyglance_evidence_stat.stat.isdir
+      - not jellyglance_evidence_stat.stat.islnk
+      - jellyglance_evidence_stat.stat.mode == '0700'
+      - jellyglance_evidence_stat.stat.pw_name == (user.name if jellyglance_test_mode else 'root')
+    fail_msg: JellyGlance evidence interface validation failed
+
+- name: Validate JellyGlance override collection types
+  ansible.builtin.assert:
+    that:
+      - jellyglance_role_docker_envs_custom | type_debug == 'dict'
+      - jellyglance_role_docker_envs_protected | type_debug == 'list'
+      - jellyglance_role_docker_volumes_custom | type_debug == 'list'
+      - jellyglance_role_docker_volume_targets_protected | type_debug == 'list'
+    fail_msg: JellyGlance override collection type invalid
+
+- name: Validate JellyGlance custom volume syntax
+  ansible.builtin.assert:
+    that:
+      - item | type_debug == 'str'
+      - item is regex('^[^:]+:/[^:]+(?::(?:ro|rw|z|Z)(?:,(?:ro|rw|z|Z))*)?$')
+    fail_msg: JellyGlance custom volume syntax invalid
+  loop: "{{ jellyglance_role_docker_volumes_custom }}"
+
+- name: Calculate JellyGlance protected override collisions
+  ansible.builtin.set_fact:
+    jellyglance_env_collisions: "{{ jellyglance_role_docker_envs_custom.keys() | list | intersect(jellyglance_role_docker_envs_protected) }}"
+    jellyglance_volume_targets_custom: >-
+      {{ jellyglance_role_docker_volumes_custom
+         | map('regex_replace', '^[^:]+:([^:]+)(?::(?:ro|rw|z|Z)(?:,(?:ro|rw|z|Z))*)?$', '\1')
+         | list }}
+
+- name: Reject protected JellyGlance environment collisions
+  ansible.builtin.assert:
+    that:
+      - jellyglance_env_collisions | length == 0
+    fail_msg: protected environment collision
+
+- name: Reject protected JellyGlance volume collisions
+  ansible.builtin.assert:
+    that:
+      - jellyglance_volume_targets_custom | intersect(jellyglance_role_docker_volume_targets_protected) | length == 0
+    fail_msg: protected volume collision
+
+- name: Inspect JellyGlance state and secret paths without following links
+  ansible.builtin.stat:
+    path: "{{ item }}"
+    follow: false
+  loop:
+    - "{{ lookup('role_var', '_paths_location', role='jellyglance') }}"
+    - "{{ lookup('role_var', '_paths_config_location', role='jellyglance') }}"
+    - "{{ lookup('role_var', '_paths_backups_location', role='jellyglance') }}"
+    - "{{ lookup('role_var', '_paths_postgres_location', role='jellyglance') }}"
+    - "{{ lookup('role_var', '_paths_jwt_secret_file', role='jellyglance') }}"
+    - "{{ lookup('role_var', '_paths_postgres_password_file', role='jellyglance') }}"
+  register: jellyglance_path_stats
+
+- name: Record JellyGlance path inspection facts
+  ansible.builtin.set_fact:
+    jellyglance_state_stat: "{{ jellyglance_path_stats.results[0].stat }}"
+    jellyglance_config_stat: "{{ jellyglance_path_stats.results[1].stat }}"
+    jellyglance_backups_stat: "{{ jellyglance_path_stats.results[2].stat }}"
+    jellyglance_postgres_stat: "{{ jellyglance_path_stats.results[3].stat }}"
+    jellyglance_jwt_stat: "{{ jellyglance_path_stats.results[4].stat }}"
+    jellyglance_postgres_secret_stat: "{{ jellyglance_path_stats.results[5].stat }}"
+
+- name: Reject non-directory JellyGlance state paths
+  ansible.builtin.assert:
+    that:
+      - not jellyglance_state_stat.exists or (jellyglance_state_stat.isdir and not jellyglance_state_stat.islnk)
+      - not jellyglance_config_stat.exists or (jellyglance_config_stat.isdir and not jellyglance_config_stat.islnk)
+      - not jellyglance_backups_stat.exists or (jellyglance_backups_stat.isdir and not jellyglance_backups_stat.islnk)
+      - not jellyglance_postgres_stat.exists or (jellyglance_postgres_stat.isdir and not jellyglance_postgres_stat.islnk)
+    fail_msg: JellyGlance state path file type invalid
+
+- name: Probe JellyGlance state directories for content
+  ansible.builtin.command:
+    argv:
+      - /usr/bin/find
+      - "{{ item.path }}"
+      - -mindepth
+      - "1"
+      - -maxdepth
+      - "1"
+      - -print
+      - -quit
+  loop:
+    - path: "{{ lookup('role_var', '_paths_config_location', role='jellyglance') }}"
+      stat: "{{ jellyglance_config_stat }}"
+    - path: "{{ lookup('role_var', '_paths_backups_location', role='jellyglance') }}"
+      stat: "{{ jellyglance_backups_stat }}"
+    - path: "{{ lookup('role_var', '_paths_postgres_location', role='jellyglance') }}"
+      stat: "{{ jellyglance_postgres_stat }}"
+  when: item.stat.exists and item.stat.isdir and not item.stat.islnk
+  changed_when: false
+  register: jellyglance_state_content
+
+- name: Classify JellyGlance deployment state
+  ansible.builtin.set_fact:
+    jellyglance_state_is_new: >-
+      {{ (jellyglance_state_content.results[0].stdout | default('') | length == 0)
+         and (jellyglance_state_content.results[1].stdout | default('') | length == 0)
+         and (jellyglance_state_content.results[2].stdout | default('') | length == 0) }}
+    jellyglance_both_secrets_exist: "{{ jellyglance_jwt_stat.exists and jellyglance_postgres_secret_stat.exists }}"
+    jellyglance_neither_secret_exists: "{{ not jellyglance_jwt_stat.exists and not jellyglance_postgres_secret_stat.exists }}"
+
+- name: Reject partial JellyGlance secret pair
+  ansible.builtin.assert:
+    that:
+      - jellyglance_both_secrets_exist or jellyglance_neither_secret_exists
+    fail_msg: partial secret pair
+
+- name: Reject missing JellyGlance secrets for existing state
+  ansible.builtin.assert:
+    that:
+      - jellyglance_state_is_new or jellyglance_both_secrets_exist
+    fail_msg: secret pair missing for existing state
+
+- name: Validate JellyGlance secret path types
+  ansible.builtin.assert:
+    that:
+      - jellyglance_jwt_stat.isreg and not jellyglance_jwt_stat.islnk
+      - jellyglance_postgres_secret_stat.isreg and not jellyglance_postgres_secret_stat.islnk
+    fail_msg: symlink or non-regular file type in secret pair
+  when: jellyglance_both_secrets_exist
+
+- name: Validate JellyGlance secret ownership
+  ansible.builtin.assert:
+    that:
+      - jellyglance_jwt_stat.pw_name == user.name
+      - jellyglance_jwt_stat.gr_name == user.name
+      - jellyglance_postgres_secret_stat.pw_name == user.name
+      - jellyglance_postgres_secret_stat.gr_name == user.name
+    fail_msg: wrong-owner secret pair
+  when: jellyglance_both_secrets_exist
+
+- name: Read existing JellyGlance secrets
+  ansible.builtin.slurp:
+    src: "{{ item }}"
+  loop:
+    - "{{ lookup('role_var', '_paths_jwt_secret_file', role='jellyglance') }}"
+    - "{{ lookup('role_var', '_paths_postgres_password_file', role='jellyglance') }}"
+  register: jellyglance_secret_contents
+  when: jellyglance_both_secrets_exist
+  no_log: true
+
+- name: Calculate JellyGlance raw secret validity
+  ansible.builtin.set_fact:
+    jellyglance_raw_secrets_valid: >-
+      {{ (jellyglance_secret_contents.results[0].content | b64decode | length == 65)
+         and (jellyglance_secret_contents.results[1].content | b64decode | length == 65)
+         and ((jellyglance_secret_contents.results[0].content | b64decode) is regex('^[0-9a-f]{64}\n$'))
+         and ((jellyglance_secret_contents.results[1].content | b64decode) is regex('^[0-9a-f]{64}\n$'))
+         and ((jellyglance_secret_contents.results[0].content | b64decode)
+              != (jellyglance_secret_contents.results[1].content | b64decode)) }}
+  when: jellyglance_both_secrets_exist
+  no_log: true
+
+- name: Reject malformed JellyGlance raw secret encoding
+  ansible.builtin.assert:
+    that:
+      - jellyglance_raw_secrets_valid
+    fail_msg: malformed secret format or encoding
+  when: jellyglance_both_secrets_exist
+
+- name: Derive validated JellyGlance secret facts
+  ansible.builtin.set_fact:
+    jellyglance_jwt_secret: "{{ jellyglance_secret_contents.results[0].content | b64decode | regex_replace('\n$', '') }}"
+    jellyglance_postgres_password: "{{ jellyglance_secret_contents.results[1].content | b64decode | regex_replace('\n$', '') }}"
+  when: jellyglance_both_secrets_exist
+  no_log: true
+
+- name: Record validated JellyGlance permission repairs
+  ansible.builtin.set_fact:
+    jellyglance_secret_modes_to_repair: >-
+      {{ ([lookup('role_var', '_paths_jwt_secret_file', role='jellyglance')]
+          if jellyglance_both_secrets_exist and jellyglance_jwt_stat.mode != '0600' else [])
+         + ([lookup('role_var', '_paths_postgres_password_file', role='jellyglance')]
+            if jellyglance_both_secrets_exist and jellyglance_postgres_secret_stat.mode != '0600' else []) }}
+  no_log: true
+
+- name: Use inert Jellyfin metadata in test mode
+  ansible.builtin.set_fact:
+    jellyglance_jellyfin_before: "{{ jellyglance_test_jellyfin_metadata }}"
+  when: jellyglance_test_mode
+
+- name: Query field-only Jellyfin metadata
+  ansible.builtin.command:
+    argv:
+      - docker
+      - inspect
+      - --format
+      - "{{ item.format }}"
+      - jellyfin
+  loop:
+    - key: name
+      format: "{{ '{{.Name}}' }}"
+    - key: id
+      format: "{{ '{{.Id}}' }}"
+    - key: image
+      format: "{{ '{{.Config.Image}}' }}"
+    - key: started_at
+      format: "{{ '{{.State.StartedAt}}' }}"
+    - key: running
+      format: "{{ '{{.State.Running}}' }}"
+    - key: health
+      format: "{{ '{{if .State.Health}}{{.State.Health.Status}}{{end}}' }}"
+  register: jellyglance_jellyfin_fields
+  changed_when: false
+  when: not jellyglance_test_mode
+
+- name: Normalize field-only Jellyfin metadata
+  ansible.builtin.set_fact:
+    jellyglance_jellyfin_before:
+      name: "{{ jellyglance_jellyfin_fields.results[0].stdout | regex_replace('^/', '') }}"
+      id: "{{ jellyglance_jellyfin_fields.results[1].stdout }}"
+      image: "{{ jellyglance_jellyfin_fields.results[2].stdout }}"
+      started_at: "{{ jellyglance_jellyfin_fields.results[3].stdout }}"
+      running: "{{ jellyglance_jellyfin_fields.results[4].stdout | bool }}"
+      health: "{{ jellyglance_jellyfin_fields.results[5].stdout | default('') }}"
+  when: not jellyglance_test_mode
+
+- name: Use inert DNS observations in test mode
+  ansible.builtin.set_fact:
+    jellyglance_dns_records_before: "{{ jellyglance_test_dns_records }}"
+  when: jellyglance_test_mode
+
+- name: Query JellyGlance DNS records
+  cloudflare_dns_records:
+    auth_email: "{{ cloudflare.email }}"
+    auth_key: "{{ cloudflare.api }}"
+    zone_name: "{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+    record: "{{ lookup('role_var', '_dns_record', role='jellyglance') }}.{{ lookup('role_var', '_dns_zone', role='jellyglance') }}"
+  register: jellyglance_dns_query
+  no_log: true
+  when:
+    - not jellyglance_test_mode
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+
+- name: Initialize normalized JellyGlance DNS observations
+  ansible.builtin.set_fact:
+    jellyglance_dns_records_before: []
+  when:
+    - not jellyglance_test_mode
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+
+- name: Normalize nonsecret JellyGlance DNS observations
+  ansible.builtin.set_fact:
+    jellyglance_dns_records_before: >-
+      {{ jellyglance_dns_records_before
+         + [{'name': item.name, 'type': item.type, 'content': item.content, 'proxied': item.proxied | bool}] }}
+  loop: "{{ jellyglance_dns_query.records | default([]) }}"
+  when:
+    - not jellyglance_test_mode
+    - cloudflare_records_enabled
+    - role_dns_enabled
+    - not skip_dns
+  no_log: true
+
+- name: Default disabled JellyGlance DNS observations
+  ansible.builtin.set_fact:
+    jellyglance_dns_records_before: []
+  when:
+    - not jellyglance_test_mode
+    - not (cloudflare_records_enabled and role_dns_enabled and not skip_dns)
+
+- name: Initialize JellyGlance DNS observation validity
+  ansible.builtin.set_fact:
+    jellyglance_dns_observations_valid: true
+
+- name: Validate normalized JellyGlance DNS observation fields
+  ansible.builtin.set_fact:
+    jellyglance_dns_observations_valid: >-
+      {{ (jellyglance_dns_observations_valid | bool)
+         and (item | type_debug == 'dict')
+         and (item.keys() | sort == ['content', 'name', 'proxied', 'type'])
+         and (item.get('name', '')
+              == lookup('role_var', '_dns_record', role='jellyglance')
+                 + '.' + lookup('role_var', '_dns_zone', role='jellyglance'))
+         and (item.get('type', '') in ['A', 'AAAA'])
+         and ((item.get('type', '') != 'A') or (dns_ipv4_enabled | bool))
+         and ((item.get('type', '') != 'AAAA') or (dns_ipv6_enabled | bool))
+         and ((item.get('type', '') != 'A')
+              or (item.get('content', '') == ipv4_address_public_template))
+         and ((item.get('type', '') != 'AAAA')
+              or (item.get('content', '') == ipv6_address_public_template))
+         and ((item.get('proxied', false) | bool)
+              == (lookup('role_var', '_dns_proxy', role='jellyglance') | bool)) }}
+  loop: "{{ jellyglance_dns_records_before }}"
+  no_log: true
+
+- name: Reject conflicting JellyGlance DNS records
+  ansible.builtin.assert:
+    that:
+      - jellyglance_dns_observations_valid
+    fail_msg: conflicting JellyGlance DNS record
+
+- name: Initialize JellyGlance DNS mutation evidence
+  ansible.builtin.set_fact:
+    jellyglance_dns_created_by_run: false
